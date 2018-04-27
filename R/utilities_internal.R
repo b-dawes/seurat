@@ -51,6 +51,8 @@ PercentAbove <- function(x, threshold){
 # @param lower  Lower end of reference range
 # @param upper  Upper end of reference range
 #
+#' @importFrom stats quantile
+#
 # @return       Returns a vector that describes the position of each element in
 #               x along the defined reference range
 
@@ -577,4 +579,21 @@ LengthCheck <- function(values, cutoff = 0) {
     },
     FUN.VALUE = logical(1)
   ))
+}
+
+# Reverse the vector x and return the value at the Nth index. If N is larger
+# than the length of the vector, return the last value in the reversed vector.
+#
+# @param x vector of interest
+# @param N index in reversed vector
+#
+# @return returns element at given index
+#
+MaxN <- function(x, N = 2){
+  len <- length(x)
+  if(N > len) {
+    warning('N greater than length(x).  Setting N=length(x)')
+    N <- length(x)
+  }
+  sort(x, partial = len - N + 1)[len - N + 1]
 }

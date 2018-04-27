@@ -1,3 +1,5 @@
+
+globalVariables(names = 'i', package = 'Seurat', add = TRUE)
 # Regress out technical effects and cell cycle
 #
 # Remove unwanted effects from scale.data
@@ -9,12 +11,17 @@
 # @param model.use Use a linear model or generalized linear model (poisson, negative binomial) for the regression. Options are 'linear' (default), 'poisson', and 'negbinom'
 # @param use.umi Regress on UMI count data. Default is FALSE for linear modeling, but automatically set to TRUE if model.use is 'negbinom' or 'poisson'
 # @param display.progress display progress bar for regression procedure.
+# @param do.par use parallel processing for regressing out variables faster.
+# If set to TRUE, will use half of the machines available cores (FALSE by default)
+# @param num.cores If do.par = TRUE, specify the number of cores to use.
 #
 # @return Returns the residuals from the regression model
 #
 #' @import Matrix
+#' @import doSNOW
 #' @importFrom stats as.formula lm residuals glm
 #' @importFrom utils txtProgressBar setTxtProgressBar
+#' @importFrom foreach foreach %dopar%
 #
 RegressOutResid <- function(
   object,
@@ -22,7 +29,9 @@ RegressOutResid <- function(
   genes.regress = NULL,
   model.use = 'linear',
   use.umi = FALSE,
-  display.progress = TRUE
+  display.progress = TRUE,
+  do.par = FALSE,
+  num.cores = 1
 ) {
   possible.models <- c("linear", "poisson", "negbinom")
   if (! model.use %in% possible.models){
@@ -56,7 +65,38 @@ RegressOutResid <- function(
   if (use.umi) {
     data.use <- object@raw.data[genes.regress, object@cell.names, drop = FALSE]
   }
-  for (i in 1:max.bin) {
+
+  # input checking for parallel options
+  if(do.par){
+    if(num.cores == 1){
+      num.cores <- detectCores() / 2
+    } else {
+      if(num.cores > detectCores()){
+        num.cores <- detectCores() - 1
+        warning(paste0("num.cores set greater than number of available cores(", detectCores(), "). Setting num.cores to ", num.cores, "."))
+      }
+    }
+  } else {
+    if(num.cores != 1){
+      num.cores <- 1
+      warning("For parallel processing, please set do.par to TRUE.")
+    }
+  }
+  cl<- parallel::makeCluster(num.cores)
+
+  # using doSNOW library because it supports progress bar update
+  registerDoSNOW(cl)
+
+  opts <- list()
+  if(display.progress)
+  {
+    # define progress bar function
+    progress <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress = progress)
+    time_elapsed <- Sys.time()
+  }
+
+  data.resid <- foreach(i = 1:max.bin, .combine = "rbind", .options.snow = opts) %dopar% {
     genes.bin.regress <- rownames(x = data.use)[bin.ind == i]
     gene.expr <- as.matrix(x = data.use[genes.bin.regress, , drop = FALSE])
     new.data <- do.call(
@@ -96,19 +136,17 @@ RegressOutResid <- function(
         }
       )
     )
-    if (i == 1) {
-      data.resid=new.data
-    }
-    if (i > 1) {
-      data.resid=rbind(data.resid,new.data)
-    }
-    if(display.progress) {
-      setTxtProgressBar(pb, i)
-    }
+    new.data
   }
+
   if (display.progress) {
+    time_elapsed <- Sys.time() - time_elapsed
+    cat(paste("\nTime Elapsed: ",time_elapsed, units(time_elapsed)))
     close(pb)
   }
+
+  stopCluster(cl)
+
   rownames(x = data.resid) <- genes.regress
   if (use.umi) {
     data.resid <- log1p(
@@ -244,8 +282,8 @@ RegressOutNBreg <- function(
         FUN = function(j) {
           as.numeric(
             x = MASS::theta.ml(
-              cm[j, ],
-              glm(cm[j, ] ~ ., data = latent.data, family=poisson)$fitted
+              as.numeric(x = unlist(x = cm[j, ])),
+              glm(as.numeric(x = unlist(x = cm[j, ])) ~ ., data = latent.data, family=poisson)$fitted
             )
           )
         }
@@ -279,33 +317,38 @@ RegressOutNBreg <- function(
   pr <- c()
   for(i in 1:max.bin) {
     genes.bin.regress <- genes.regress[bin.ind == i]
+    names(genes.bin.regress) <- genes.bin.regress
     bin.pr.lst <- parallel::mclapply(
       X = genes.bin.regress,
       FUN = function(j) {
         fit <- 0
         try(
           fit <- glm(
-            cm[j, ] ~ .,
+            as.numeric(x = unlist(x = cm[j, ])) ~ .,
             data = latent.data,
             family=MASS::negative.binomial(theta = theta.fit[j])
           ),
           silent=TRUE
         )
         if (class(fit)[1] == 'numeric') {
-          message(
+          message <- 
             sprintf(
               'glm and family=negative.binomial(theta=%f) failed for gene %s; falling back to scale(log10(y+1))',
               theta.fit[j],
               j
             )
-          )
-          res <- scale(x = log10(cm[j, ] + 1))[, 1]
+          res <- scale(x = log10(as.numeric(x = unlist(x = cm[j, ])) + 1))[, 1]
         } else {
+          message <- NULL
           res <- residuals(object = fit, type='pearson')
         }
-        return(res)
+        return(list(res = res, message = message))
       }
     )
+    # Print message to keep track of the genes for which glm failed to converge
+    message <- unlist(x = lapply(X = bin.pr.lst, FUN = function(l) { return(l$message) }), use.names = FALSE)
+    if(!is.null(x = message)) { message(paste(message, collapse = "\n")) }
+    bin.pr.lst <- lapply(X = bin.pr.lst, FUN = function(l) { return(l$res) })
     pr <- rbind(pr, do.call(rbind, bin.pr.lst))
     setTxtProgressBar(pb, i)
   }
